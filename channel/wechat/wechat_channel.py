@@ -4,12 +4,17 @@
 wechat channel
 """
 
+from functools import lru_cache
 import io
 import json
 import os
 import threading
 import time
 import requests
+import asyncio
+import aiohttp
+from aiohttp import web
+import threading
 
 from bridge.context import *
 from bridge.reply import *
@@ -167,6 +172,68 @@ class WechatChannel(ChatChannel):
 
     def loginCallback(self):
         logger.debug("Login success")
+        users = itchat.search_friends("z-")
+        if users:
+            itchat.send('Login success', toUserName=users[0]['UserName'])
+        self.start_http_server()  # 启动HTTP服务器
+        
+    def start_http_server(self):
+        
+        @lru_cache()
+        def find_user(to):
+            users = itchat.search_friends(to)
+            if users:
+                to = users[0]['UserName']
+                return to 
+            
+            group_list = itchat.search_chatrooms(to)
+            if group_list:
+                return group_list[0]['UserName']
+            
+            return to
+            
+        
+        async def handle_send(request):
+            try:
+                data = await request.json()
+                to = data.get('to')
+                content = data.get('content')
+                image_url = data.get('image_url')
+                
+                if not to:
+                    return web.Response(status=400, text='Missing "to" parameter')
+                
+                if image_url:
+                    reply = Reply(ReplyType.IMAGE_URL, image_url)
+                else:
+                    reply = Reply(ReplyType.TEXT, content)
+                    
+                context = Context(kwargs={
+                    "receiver": find_user(to),
+                })
+                self.send(reply, context)
+                return web.Response(text='Message sent')
+            except Exception as e:
+                logger.error(f"Error handling send request: {e}")
+                return web.Response(status=500, text=str(e))
+
+        async def start_server():
+            app = web.Application()
+            app.router.add_post('/api/send', handle_send)
+            runner = web.AppRunner(app)
+            await runner.setup()
+            site = web.TCPSite(runner, 'localhost', 10080)
+            await site.start()
+            logger.info("HTTP server started on port 10080")
+
+        def run_server():
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            loop.run_until_complete(start_server())
+            loop.run_forever()
+
+        server_thread = threading.Thread(target=run_server, daemon=True)
+        server_thread.start()
 
     # handle_* 系列函数处理收到的消息后构造Context，然后传入produce函数中处理Context和发送回复
     # Context包含了消息的所有信息，包括以下属性
@@ -250,7 +317,7 @@ class WechatChannel(ChatChannel):
         elif reply.type == ReplyType.IMAGE_URL:  # 从网络下载图片
             img_url = reply.content
             logger.debug(f"[WX] start download image, img_url={img_url}")
-            pic_res = requests.get(img_url, stream=True)
+            pic_res = requests.get(img_url, stream=True, timeout=(2, 10))
             image_storage = io.BytesIO()
             size = 0
             for block in pic_res.iter_content(1024):
